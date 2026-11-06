@@ -1,0 +1,4 @@
+Data source: DataMeet India community, Maps repository, States/Admin2 shapefile
+Source URL: https://github.com/datameet/maps/tree/master/States
+License: CC BY 4.0 (attribution required; see https://github.com/datameet/maps#data-license)
+The local GeoJSON is converted from the repository's WGS 84 state/UT boundaries.
