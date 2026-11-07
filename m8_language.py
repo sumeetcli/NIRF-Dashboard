@@ -67,7 +67,9 @@ def parse_question(question, df=None):
     if not isinstance(question, str) or not question.strip():
         return {"status": "unsupported", "message": "Enter a question to analyze."}
 
-    text = question.lower().strip()
+    text = question.lower().strip().translate(str.maketrans({
+        "’": "'", "‘": "'", "“": '"', "”": '"', "–": "-", "—": "-",
+    }))
     text = re.sub(r"\buniversities\b", "university", text)
     text = re.sub(r"\binstitutes\b|\binstitutions\b", "institution", text)
     for alias, canonical in M8_WORD_ALIASES.items():
@@ -192,6 +194,12 @@ def parse_question(question, df=None):
     category_hits = []
     category_cue = bool(re.search(r"\bcategory\b|\btype\b", text))
     for category in category_values:
+        if (
+            category == "Overall" and not category_cue
+            and re.search(r"\boverall\s+(?:score|rank|ranking|performance)\b", text)
+        ):
+            # Here "overall" describes the measure, not the NIRF category.
+            continue
         aliases = M8_CATEGORY_ALIASES.get(category, [str(category).lower()])
         if any(re.search(r"\b" + re.escape(alias) + r"\b", text) for alias in aliases):
             category_hits.append(category)
@@ -228,6 +236,14 @@ def parse_question(question, df=None):
         params["states"] = state_hits
     elif len(state_hits) == 1 and state_context:
         filters["state"] = state_hits
+    if institution_names and state_hits and df is not None and "institution_id" in df.columns:
+        candidates = df[df["institution"].isin(institution_names) & df["state"].isin(state_hits)]
+        candidate_ids = candidates["institution_id"].dropna().unique().tolist()
+        if len(candidate_ids) == 1:
+            filters["institution_id"] = candidate_ids
+        elif len(candidate_ids) > 1:
+            matched_states = sorted(candidates["state"].dropna().astype(str).unique())
+            return {"status": "needs_clarification", "message": f"That institution name matches multiple records in {', '.join(matched_states)}. Please specify the state."}
 
     # Choose module/chart from explicit concepts and chart cues; never guess on mixed chart requests.
     has = lambda pattern: bool(re.search(pattern, text))
@@ -289,12 +305,12 @@ def parse_question(question, df=None):
         chart_type = "quartile"
     elif has(r"\btop\s*(?:10|ten)\b.*\b(?:remaining|rest|other institutions?)\b"):
         chart_type = "top10_vs_rest"
+    elif has(r"\bmedian\b.*\b(?:iqr|interquartile)\b|\biqr\b"):
+        chart_type = "median_iqr"
     elif has(r"\b(?:summary statistics|stats table|statistics table|statistics)\b|\b(?:average|avg|mean|median|minimum|maximum|min|max)\b.*\b(?:score|rank)\b"):
         chart_type = "stats_table"
     elif has(r"\btop\s*(?:10|ten)\s+(?:vs|versus|and)\s+(?:the\s+)?rest\b"):
         chart_type = "top10_vs_rest"
-    elif has(r"\bmedian\b.*\b(?:iqr|interquartile)\b|\biqr\b"):
-        chart_type = "median_iqr"
     elif has(r"\bparameter\s+variability|\bmost\s+variable\s+parameter|\bparameter\b.*\b(?:greatest|highest|largest)\s+variability"):
         chart_type = "parameter_variability"
     elif has(r"\bcorrelation\b") and has(r"\b(?:strongest|highest|largest)\b") and has(r"\bparameter\b") and has(r"\boverall\s+score\b"):
@@ -303,6 +319,11 @@ def parse_question(question, df=None):
         chart_type = "parameter_distribution"
     elif has(r"\b(?:correlation|corr|relationship)\b") and has(r"\b(?:over time|by year|trend|changed)\b"):
         chart_type = "correlation_trend"
+    elif has(r"\bscore\b") and has(r"\b(?:trend|over time|by year|chang\w*)\b"):
+        # A general score trend means the yearly mean score for the filtered
+        # population (for example, all institutions in a named state).
+        chart_type = "parameter_trend"
+        params["columns"] = ["score"]
     elif has(r"\b(?:average|avg|mean)\b.*\bscore\b.*\b(?:over time|by year|trend)\b"):
         chart_type = "parameter_trend"
         params["columns"] = ["score"]
@@ -380,6 +401,11 @@ def parse_question(question, df=None):
         return {"status": "unsupported", "message": "I could not identify an M3-M7 analysis. Try naming a chart or question, such as 'hist RPC', 'state choropleth', or 'RPC vs score scatter'."}
 
     intent = M8_CHART_ROUTE[chart_type]
+    if chart_type == "state_trend":
+        if has(r"\b(?:improv\w*|increas\w*|grow\w*|growth)\b"):
+            params["state_order"] = "increase"
+        elif has(r"\b(?:declin\w*|decreas\w*|drop\w*|fall\w*)\b"):
+            params["state_order"] = "decrease"
     asks_for_selected_institution = bool(
         re.search(r"\bselected\s+(?:institution|university)\b", text)
     )
@@ -422,6 +448,17 @@ def parse_question(question, df=None):
     return {
         "status": "ready", "intent": intent, "chart_type": chart_type,
         "filters": filters, "params": params, "normalized_question": text,
+        "question_focus": (
+            "which" if re.search(r"\bwhich\b", text)
+            else "when" if re.search(r"\bwhen\b", text)
+            else None
+        ),
+        "question_entity": (
+            "state" if re.search(r"\bstates?\b", text)
+            else "parameter" if re.search(r"\bparameters?\b", text)
+            else "institution" if re.search(r"\binstitution|university|college\b", text)
+            else None
+        ),
     }
 
 
@@ -442,16 +479,40 @@ def dispatch_question(parsed, df, filters=None):
         present_years = set(pd.to_numeric(scope["year"], errors="coerce").dropna().astype(int).unique())
         missing_years = [int(year) for year in requested_years if int(year) not in present_years]
         if missing_years:
-            available = sorted(present_years)
-            return {
-                "status": "unavailable",
-                "message": f"No records were found for {', '.join(map(str, missing_years))} with the selected filters. No chart was generated.",
-                "alternatives": [
-                    f"Use available years in this selection: {available[:3]}{'...' if len(available) > 3 else ''}.",
-                    "Choose another category, state, or institution that has records for those years.",
-                    "Choose a different year range or ask for a summary of the available period.",
-                ],
-            }
+            is_requested_range = {"start_year", "end_year"}.issubset(params)
+            if is_requested_range:
+                available_in_range = sorted(year for year in requested_years if int(year) in present_years)
+                if chart_type in {"transition", "transition_percentage", "improvement", "decline"}:
+                    endpoints = [int(params["start_year"]), int(params["end_year"])]
+                    absent_endpoints = [year for year in endpoints if year not in present_years]
+                    if absent_endpoints:
+                        return {
+                            "status": "unavailable",
+                            "message": f"No records were found for the requested transition endpoint(s): {', '.join(map(str, absent_endpoints))}. No chart was generated.",
+                            "alternatives": ["Choose endpoint years with records for the selected institution/category.", "Use a rank trend to show the years that are available."],
+                        }
+                elif available_in_range:
+                    # Ranges may include years in which a selected institution or
+                    # category has no record. Plot observed years without inventing
+                    # zero values; trend renderers still require multiple points.
+                    merged_filters["year"] = available_in_range
+                else:
+                    return {
+                        "status": "unavailable",
+                        "message": f"No records were found between {params['start_year']} and {params['end_year']} with the selected filters. No chart was generated.",
+                        "alternatives": ["Choose another category, state, or institution that has records in this period.", "Use a year range with available data."],
+                    }
+            else:
+                available = sorted(present_years)
+                return {
+                    "status": "unavailable",
+                    "message": f"No records were found for {', '.join(map(str, missing_years))} with the selected filters. No chart was generated.",
+                    "alternatives": [
+                        f"Use available years in this selection: {available[:3]}{'...' if len(available) > 3 else ''}.",
+                        "Choose another category, state, or institution that has records for those years.",
+                        "Choose a different year range or ask for a summary of the available period.",
+                    ],
+                }
 
     # A few member charts require explicit scope to avoid invalid comparisons.
     categories = merged_filters.get("category")
@@ -495,6 +556,7 @@ def dispatch_question(parsed, df, filters=None):
         return {"status": "unsupported", "message": "That chart route is not available in the current M3-M7 notebook."}
 
     prepare, render = routes[intent]
+    answer_year_pair = None
     if intent == "mobility":
         # M3 needs prior years to calculate a movement; calculate history first,
         # then keep only the years the user requested for display.
@@ -507,6 +569,17 @@ def dispatch_question(parsed, df, filters=None):
             ].copy()
         elif requested_years is not None and chart_type not in endpoint_charts and chart_type not in {"transition", "transition_percentage"}:
             result = result[result["year"].isin(requested_years)].copy()
+        if chart_type in {"trend", "year_trend_bar"}:
+            ranked_rows = result[pd.to_numeric(result["rank"], errors="coerce").ge(1)]
+            identity = (["category"] if "category" in ranked_rows else []) + ["institution_id" if "institution_id" in ranked_rows else "institution"]
+            enough_history = not ranked_rows.empty and ranked_rows.groupby(identity)["year"].nunique().ge(2).any()
+            if not enough_history:
+                years_available = sorted(map(int, pd.to_numeric(ranked_rows["year"], errors="coerce").dropna().astype(int).unique()))
+                return {
+                    "status": "unavailable",
+                    "message": f"A rank trend needs ranked records in at least two years. Available year(s) for this selection: {years_available or 'none'}. No chart was generated.",
+                    "alternatives": ["Choose an institution/category with records in multiple years.", "Ask for a single-year rank or score summary instead."],
+                }
         render_params = {key: params[key] for key in ("start_year", "end_year", "top_n") if key in params}
         if chart_type in {"transition", "transition_percentage"} and not {"start_year", "end_year"}.issubset(render_params):
             if len(years) >= 2:
@@ -523,22 +596,34 @@ def dispatch_question(parsed, df, filters=None):
                 return {"status": "needs_input", "message": "A rank-band transition needs a start and end year. Specify a range."}
         if chart_type == "movement" and not result["movement"].isin(["up", "down", "same"]).any():
             return {"status": "unavailable", "message": "No adjacent-year rank comparison is available for the selected year(s). No chart was generated.", "alternatives": ["Include a later year with ranked records.", "Choose a later year range.", "Use a rank trend chart for the selected year(s)."]}
+        if chart_type in {"transition", "transition_percentage"}:
+            answer_year_pair = (int(render_params["start_year"]), int(render_params["end_year"]))
         figure = render(result, chart_type=chart_type, **render_params)
     elif intent == "geospatial":
         result = prepare(df, merged_filters, top_n=params.get("top_n", 100))
+        if chart_type == "state_trend" and result["state_summary"]["year"].nunique() < 2:
+            return {"status": "needs_input", "message": "A state trend needs at least two years. Give a year range or clear the Year filter."}
         render_params = {"chart_type": chart_type}
-        render_params["top_states"] = params.get("top_states", 8)
+        render_params["top_states"] = params.get(
+            "top_states", 10 if chart_type == "state_bar" else 8
+        )
+        if chart_type == "state_trend":
+            render_params["state_order"] = params.get("state_order", "representation")
         if chart_type == "state_compare":
             render_params["states"] = params.get("states", ["Karnataka", "Tamil Nadu"])
         figure = render(result, **render_params)
     elif intent == "distribution":
         result = prepare(df, merged_filters, value_column=params.get("value_column", "score"))
+        if chart_type == "median_iqr" and result["data"]["year"].nunique() < 2:
+            return {"status": "unavailable", "message": "A median and IQR trend needs data in at least two years. No chart was generated.", "alternatives": ["Choose a wider year range or a category with records in multiple years."]}
         figure = render(result, chart_type=chart_type)
     elif intent == "relationship":
         prep_params = {"method": params.get("method", "pearson")}
         if "columns" in params:
             prep_params["columns"] = params["columns"]
         result = prepare(df, merged_filters, **prep_params)
+        if chart_type in {"trend", "correlation_trend", "parameter_trend"} and result["data"]["year"].nunique() < 2:
+            return {"status": "unavailable", "message": "A relationship trend needs valid data in at least two years. No chart was generated.", "alternatives": ["Choose a wider year range or clear the Year filter.", "Choose another category or variable pair with data across multiple years."]}
         render_params = {"chart_type": chart_type}
         for key in ("x_var", "y_var", "degree"):
             if key in params:
@@ -550,9 +635,224 @@ def dispatch_question(parsed, df, filters=None):
         result = prepare(df, merged_filters)
         figure = render(result, chart_type=chart_type)
 
+    # Build a short answer from the plotted traces, so question words such as
+    # "which" and "when" return concrete names/years alongside the figure.
+    focus = parsed.get("question_focus")
+    answer = None
+    answer_table_override = None
+    answer_rows = []
+    if focus:
+        for trace in figure.data:
+            trace_x = getattr(trace, "x", None)
+            trace_y = getattr(trace, "y", None)
+            if trace_x is None and trace_y is None:
+                # Plotly table traces expose cells rather than x/y coordinates.
+                continue
+            xs = list(trace_x) if trace_x is not None else []
+            ys = list(trace_y) if trace_y is not None else []
+            series_name = str(trace.name) if trace.name else ""
+            for index, y_value in enumerate(ys):
+                x_value = xs[index] if index < len(xs) else None
+                answer_rows.append({"series": series_name, "year_or_group": x_value, "value": y_value})
+
+        if focus == "which":
+            names = []
+            if intent == "distribution" and chart_type == "median_iqr":
+                value_column = result["value_column"]
+                measure_label = "overall score" if value_column == "score" else f"{value_column.upper()} score"
+                yearly = result["data"].groupby("year")[value_column].agg(
+                    q1=lambda values: values.quantile(.25),
+                    median="median",
+                    q3=lambda values: values.quantile(.75),
+                ).dropna(subset=["median"])
+                if not yearly.empty:
+                    yearly["iqr"] = yearly["q3"] - yearly["q1"]
+                    best = yearly[yearly["median"].eq(yearly["median"].max())]
+                    answer = "; ".join(
+                        f"{int(year)} had the highest median {measure_label} "
+                        f"({row['median']:.2f}); its IQR was {row['iqr']:.2f} "
+                        f"(Q1 {row['q1']:.2f} to Q3 {row['q3']:.2f})"
+                        for year, row in best.iterrows()
+                    ) + "."
+                    answer_table_override = best.reset_index().rename(columns={"q1": "Q1", "median": "Median", "q3": "Q3", "iqr": "IQR"})
+            if intent == "mobility" and chart_type in {"transition", "transition_percentage"} and answer_year_pair:
+                start_year, end_year = answer_year_pair
+                ranked = result.copy()
+                ranked["rank"] = pd.to_numeric(ranked["rank"], errors="coerce")
+                valid = ranked["rank"].ge(1)
+                if "rank_status" in ranked:
+                    valid &= ranked["rank_status"].ne("Rank withdrawn")
+                identity = (["category"] if "category" in ranked.columns else []) + ["institution_id" if "institution_id" in ranked.columns else "institution"]
+                display_identity = [c for c in ["institution", "state"] if c in ranked and c not in identity]
+                start_top = ranked.loc[
+                    valid & ranked["year"].eq(start_year) & ranked["rank"].le(10),
+                    identity + display_identity + ["rank"],
+                ].rename(columns={"rank": "rank_at_start"})
+                end_top = ranked.loc[
+                    valid & ranked["year"].eq(end_year) & ranked["rank"].le(10),
+                    identity + display_identity + ["rank"],
+                ].rename(columns={"rank": "rank_at_end"})
+                start_keys = set(map(tuple, start_top[identity].itertuples(index=False, name=None)))
+                end_keys = set(map(tuple, end_top[identity].itertuples(index=False, name=None)))
+                entered_keys = end_keys - start_keys
+                exited_keys = start_keys - end_keys
+                entered = end_top[
+                    end_top[identity].apply(lambda row: tuple(row) in entered_keys, axis=1)
+                ].copy()
+                exited = start_top[
+                    start_top[identity].apply(lambda row: tuple(row) in exited_keys, axis=1)
+                ].copy()
+                entered["transition"] = f"Entered Top 10 in {end_year}"
+                exited["transition"] = f"Exited Top 10 after {start_year}"
+                transition_rows = pd.concat([entered, exited], ignore_index=True, sort=False)
+                if "state" in transition_rows and transition_rows["institution"].duplicated(keep=False).any():
+                    transition_rows["institution"] = transition_rows["institution"].astype(str) + " — " + transition_rows["state"].fillna("Unknown state").astype(str)
+                if "category" in transition_rows and transition_rows["category"].nunique() > 1:
+                    transition_rows["institution"] = (
+                        transition_rows["institution"].astype(str)
+                        + " (" + transition_rows["category"].astype(str) + ")"
+                    )
+                transition_rows = transition_rows[
+                    ["transition", "institution", *(["category"] if "category" in transition_rows else []),
+                     *(["rank_at_start"] if "rank_at_start" in transition_rows else []),
+                     *(["rank_at_end"] if "rank_at_end" in transition_rows else [])]
+                ]
+                answer_table_override = transition_rows
+                entered_names = transition_rows.loc[
+                    transition_rows["transition"].str.startswith("Entered"), "institution"
+                ].astype(str).tolist()
+                exited_names = transition_rows.loc[
+                    transition_rows["transition"].str.startswith("Exited"), "institution"
+                ].astype(str).tolist()
+                answer = (
+                    f"Top-10 changes from {start_year} to {end_year}. "
+                    f"Entered: {', '.join(entered_names) if entered_names else 'none'}. "
+                    f"Exited: {', '.join(exited_names) if exited_names else 'none'}."
+                )
+            if intent == "geospatial" and chart_type in {"state_bar", "state_trend"} and parsed.get("question_entity") == "state":
+                summary = result["state_summary"].copy()
+                if chart_type == "state_trend":
+                    years_scope = sorted(summary["year"].dropna().astype(int).unique())
+                    states_scope = sorted(summary.loc[summary["institutions"].gt(0), "state"].dropna().astype(str).unique())
+                    grid = pd.MultiIndex.from_product([years_scope, states_scope], names=["year", "state"]).to_frame(index=False)
+                    summary = grid.merge(summary[["year", "state", "institutions"]], on=["year", "state"], how="left").fillna({"institutions": 0}).sort_values("year")
+                    state_totals = summary.groupby("state").agg(first=("institutions", "first"), last=("institutions", "last"), start_year=("year", "first"), end_year=("year", "last")).reset_index()
+                    state_totals["change"] = state_totals["last"] - state_totals["first"]
+                    increasing = params.get("state_order") != "decrease"
+                    state_totals = state_totals[state_totals["change"].gt(0) if increasing else state_totals["change"].lt(0)]
+                    state_totals = state_totals.sort_values("change", ascending=not increasing).head(int(params.get("top_states", 8)))
+                    direction = "increase" if increasing else "decrease"
+                    answer = (f"States with the largest {direction} in representation: " + "; ".join(f"{r.state} ({int(r.change):+d}; {int(r.first)} to {int(r.last)} institutions, {int(r.start_year)}–{int(r.end_year)})" for r in state_totals.itertuples(index=False))) if not state_totals.empty else f"No states increased their representation over {years_scope[0]}–{years_scope[-1]}."
+                    answer_table_override = state_totals
+                else:
+                    state_totals = summary.groupby("state", as_index=False)["institutions"].sum().rename(columns={"institutions": "top_n_institution_years"}).sort_values("top_n_institution_years", ascending=False).head(int(params.get("top_states", 10)))
+                    per_year = summary[summary["state"].isin(state_totals["state"])].merge(state_totals, on="state", how="left").sort_values(["top_n_institution_years", "year"], ascending=[False, True])
+                    n_label = result.get("top_n") or "all ranked"
+                    answer = f"States with the highest Top-{n_label} representation across the selected years: " + "; ".join(f"{row.state} ({int(row.top_n_institution_years)} institution-year appearances)" for row in state_totals.itertuples(index=False))
+                    answer_table_override = per_year.rename(columns={"institutions": f"institutions_in_top_{n_label}", "top_n_institution_years": "selected_year_total"})
+            if intent == "geospatial" and chart_type == "new_entries" and parsed.get("question_entity") == "state":
+                entries = result["entry_summary"].copy()
+                state_totals = entries.groupby("state", as_index=False)["new_entries"].sum().sort_values("new_entries", ascending=False).head(int(params.get("top_states", 10)))
+                answer = "States with the most newly appearing institutions: " + "; ".join(f"{r.state} ({int(r.new_entries)})" for r in state_totals.itertuples(index=False))
+                answer_table_override = state_totals
+            if intent == "relationship" and chart_type == "score_correlations" and parsed.get("question_entity") == "parameter":
+                correlations = result["correlation"]["score"].drop(labels=["score"], errors="ignore").dropna().sort_values(key=lambda values: values.abs(), ascending=False)
+                answer_table_override = correlations.rename_axis("Parameter").rename("Correlation with overall score").reset_index()
+                if not correlations.empty:
+                    answer = f"{correlations.index[0].upper()} has the strongest absolute correlation with overall score (r = {correlations.iloc[0]:.2f})."
+            # For institution-level lines, each Plotly trace is an institution.
+            if intent == "mobility" and chart_type == "trend":
+                names.extend(str(trace.name) for trace in figure.data if trace.name)
+            if intent == "mobility" and chart_type == "top10":
+                for trace in figure.data:
+                    if trace.x is not None:
+                        names.extend(str(value) for value in trace.x if value is not None)
+            # Horizontal ranking charts put institution names on the category axis.
+            if intent == "mobility" and chart_type in {"improvement", "decline", "largest_movement"}:
+                for trace in figure.data:
+                    if trace.y is not None:
+                        names.extend(str(value) for value in trace.y if value is not None)
+            if intent == "multivariate" and chart_type in {"score_gain_parameter_decline", "volatility"}:
+                for trace in figure.data:
+                    values = trace.y if chart_type == "score_gain_parameter_decline" else trace.x
+                    if values is not None:
+                        names.extend(str(value) for value in values if value is not None)
+            # M4 entry counts can also name the newly appearing institutions.
+            if intent == "geospatial" and chart_type == "new_entries" and parsed.get("question_entity") != "state":
+                new_rows = result["all_data"]
+                if "is_new_entry" in new_rows:
+                    mask = new_rows["is_new_entry"].astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
+                    names.extend(new_rows.loc[mask, "institution"].dropna().astype(str).tolist())
+            # For M7 outlier charts, report only institutions flagged by the
+            # same condition used to colour the chart.
+            if intent == "multivariate" and isinstance(result, dict) and "data" in result:
+                flag = {
+                    "outlier": "rpc_outlier",
+                    "research_score_relative_outlier": "rpc_relative_outlier",
+                    "gap_outlier": "gap_outlier",
+                    "score_change": "score_change_outlier",
+                }.get(chart_type)
+                rows = result["data"]
+                if chart_type == "research_teaching":
+                    flag = "research_teaching_high"
+                elif chart_type == "teaching_perception":
+                    flag = "teaching_perception_high"
+                elif chart_type == "parameter_rank":
+                    flag = "strong_parameter_poor_rank"
+                elif chart_type == "gap" and "parameter_gap" in rows:
+                    names.extend(rows.nlargest(20, "parameter_gap")["institution_label"].dropna().astype(str).tolist())
+                if flag in rows.columns and "institution" in rows.columns:
+                    flagged = rows[flag].astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
+                    label_column = "institution_label" if "institution_label" in rows else "institution"
+                    names.extend(rows.loc[flagged, label_column].dropna().astype(str).tolist()[:20])
+            # Deduplicate while preserving the chart's displayed order.
+            names = list(dict.fromkeys(names))
+            if answer is None and names:
+                answer = "Institutions shown: " + "; ".join(names)
+            elif answer is None:
+                answer = "The chart does not identify individual institutions for this analysis; see its plotted series and filters."
+        elif focus == "when":
+            institutions = merged_filters.get("institution", [])
+            institutions = institutions if isinstance(institutions, (list, tuple, set)) else [institutions]
+            if not institutions and intent == "mobility" and chart_type == "trend":
+                institutions = [str(trace.name) for trace in figure.data if trace.name]
+            years_in_chart = sorted({
+                int(float(row["year_or_group"])) for row in answer_rows
+                if row["year_or_group"] is not None
+                and str(row["year_or_group"]).replace(".0", "").isdigit()
+                and 1900 <= int(float(row["year_or_group"])) <= 2100
+            })
+            if chart_type == "new_entries":
+                years_in_chart = sorted({
+                    int(str(trace.name)) for trace in figure.data
+                    if trace.name and str(trace.name).isdigit()
+                })
+            subject = ", ".join(map(str, institutions)) if institutions else "the selected data"
+            answer = f"For {subject}, the chart covers {', '.join(map(str, years_in_chart)) or 'the displayed period'}. See the plotted values for the relevant year(s)."
+
+    if intent == "distribution" and chart_type == "median_iqr" and answer is None:
+        value_column = result["value_column"]
+        measure_label = "overall score" if value_column == "score" else f"{value_column.upper()} score"
+        yearly = result["data"].groupby("year")[value_column].agg(
+            q1=lambda values: values.quantile(.25),
+            median="median",
+            q3=lambda values: values.quantile(.75),
+        ).reset_index().sort_values("year")
+        yearly["iqr"] = yearly["q3"] - yearly["q1"]
+        answer_table_override = yearly.rename(columns={"q1": "Q1", "median": "Median", "q3": "Q3", "iqr": "IQR"})
+        if len(yearly) >= 2:
+            first, last = yearly.iloc[0], yearly.iloc[-1]
+            answer = (
+                f"From {int(first['year'])} to {int(last['year'])}, median {measure_label} "
+                f"changed from {first['median']:.2f} to {last['median']:.2f} "
+                f"({last['median'] - first['median']:+.2f}); IQR changed from "
+                f"{first['iqr']:.2f} to {last['iqr']:.2f} ({last['iqr'] - first['iqr']:+.2f})."
+            )
+    answer_table = answer_table_override if answer_table_override is not None else (pd.DataFrame(answer_rows) if answer_rows else None)
     return {
         "status": "ready", "intent": intent, "chart_type": chart_type,
         "filters": merged_filters, "message": f"Showing {chart_type.replace('_', ' ')} for the requested data.",
-        "figure": figure, "result": result,
+        "figure": figure, "result": result, "direct_answer": answer,
+        "answer_table": answer_table,
     }
 

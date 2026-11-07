@@ -3,12 +3,14 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from .shared import apply_filters, set_integral_year_axis
+from .shared import (add_institution_display_label, apply_filters,
+                     institution_key_columns, set_integral_year_axis)
 
 def prepare_mobility_analysis(df, filters=None, **params):
     """Prepare exact-rank trends and valid adjacent-year movement comparisons."""
     data = apply_filters(df, filters).copy()
     data["rank"] = pd.to_numeric(data["rank"], errors="coerce")
+    data = add_institution_display_label(data)
     data.loc[data["rank"].lt(1), "rank"] = np.nan
     if "rank_status" in data.columns:
         data.loc[data["rank_status"].eq("Rank withdrawn"), "rank"] = np.nan
@@ -26,7 +28,7 @@ def prepare_mobility_analysis(df, filters=None, **params):
         ranked = ranked[ranked["institution"].isin(institution_filter)].copy()
 
     # Ranks belong to a category. Never compare the same institution across categories.
-    group_columns = (["category"] if "category" in ranked.columns else []) + ["institution"]
+    group_columns = institution_key_columns(ranked)
     ranked = ranked.sort_values(group_columns + ["year"]).copy()
     grouped = ranked.groupby(group_columns, dropna=False, sort=False)
     ranked["prev_rank"] = grouped["rank"].shift(1)
@@ -57,7 +59,7 @@ def render_mobility_analysis(
         plot_data = result[result["rank"].notna() & result["rank"].ge(1)].copy()
         if plot_data.empty:
             return go.Figure().update_layout(title="No valid ranked data for the selected filters")
-        group_columns = (["category"] if "category" in plot_data.columns else []) + ["institution"]
+        group_columns = institution_key_columns(plot_data)
         plot_data["year_count"] = plot_data.groupby(group_columns)["year"].transform("nunique")
         plot_data = plot_data[plot_data["year_count"].ge(2)].drop(columns="year_count")
         if plot_data.empty:
@@ -65,25 +67,22 @@ def render_mobility_analysis(
         if top_n is not None:
             if "category" in plot_data.columns:
                 keep = (
-                    plot_data.groupby(["category", "institution"])["rank"].mean()
+                    plot_data.groupby(institution_key_columns(plot_data))["rank"].mean()
                     .groupby(level="category", group_keys=False)
                     .nsmallest(top_n)
                     .index
                 )
-                keep_pairs = set(keep.tolist())
-                plot_data = plot_data[
-                    plot_data.apply(lambda row: (row["category"], row["institution"]) in keep_pairs, axis=1)
-                ]
+                plot_data = plot_data.set_index(institution_key_columns(plot_data)).loc[keep].reset_index()
             else:
-                keep = plot_data.groupby("institution")["rank"].mean().nsmallest(top_n).index
-                plot_data = plot_data[plot_data["institution"].isin(keep)]
+                keep = plot_data.groupby(institution_key_columns(plot_data))["rank"].mean().nsmallest(top_n).index
+                plot_data = plot_data.set_index(institution_key_columns(plot_data)).loc[keep].reset_index()
         fig = px.line(
-            plot_data, x="year", y="rank", color="institution", markers=True,
+            plot_data, x="year", y="rank", color="institution_label", markers=True,
             facet_col="category" if "category" in plot_data and plot_data["category"].nunique() > 1 else None,
             facet_col_wrap=4,
             title=(
-                f"Rank Trend: {plot_data['institution'].iloc[0]}"
-                if plot_data["institution"].nunique() == 1
+                f"Rank Trend: {plot_data['institution_label'].iloc[0]}"
+                if plot_data["institution_label"].nunique() == 1
                 else f"Institution Rank Trend (best average-rank {top_n} per category)"
             )
         )
@@ -96,27 +95,22 @@ def render_mobility_analysis(
         plot_data = result[result["rank"].notna() & result["rank"].ge(1)].copy()
         if plot_data.empty:
             return go.Figure().update_layout(title="No valid ranked data for the selected filters")
-        group_columns = (["category"] if "category" in plot_data.columns else []) + ["institution"]
+        group_columns = institution_key_columns(plot_data)
         coverage = plot_data.groupby(group_columns)["year"].nunique()
         eligible = coverage[coverage.ge(2)].index
         if "category" in plot_data.columns:
-            eligible_pairs = set(eligible.tolist())
-            plot_data = plot_data[plot_data.apply(
-                lambda row: (row["category"], row["institution"]) in eligible_pairs, axis=1
-            )]
-            best = (plot_data.groupby(["category", "institution"])["rank"].mean()
+            plot_data = plot_data.set_index(group_columns).loc[eligible].reset_index()
+            best = (plot_data.groupby(group_columns)["rank"].mean()
                     .groupby(level="category", group_keys=False).nsmallest(top_n or 10).index)
-            best_pairs = set(best.tolist())
-            plot_data = plot_data[plot_data.apply(
-                lambda row: (row["category"], row["institution"]) in best_pairs, axis=1
-            )]
+            plot_data = plot_data.set_index(group_columns).loc[best].reset_index()
         else:
-            plot_data = plot_data[plot_data["institution"].isin(eligible)]
-            best = plot_data.groupby("institution")["rank"].mean().nsmallest(top_n or 10).index
-            plot_data = plot_data[plot_data["institution"].isin(best)]
-        yearly = plot_data.groupby("year", as_index=False).agg(
-            average_rank=("rank", "mean"), institutions=("institution", "nunique")
-        )
+            plot_data = plot_data.set_index(group_columns).loc[eligible].reset_index()
+            best = plot_data.groupby(group_columns)["rank"].mean().nsmallest(top_n or 10).index
+            plot_data = plot_data.set_index(group_columns).loc[best].reset_index()
+        yearly = plot_data.groupby("year", as_index=False).agg(average_rank=("rank", "mean"))
+        identity_without_category = institution_key_columns(plot_data, include_category=False)
+        counts = plot_data.drop_duplicates(["year"] + identity_without_category).groupby("year").size()
+        yearly["institutions"] = yearly["year"].map(counts).fillna(0).astype(int)
         if yearly.empty:
             return go.Figure().update_layout(title="No multi-year ranked records for this category")
         upper = max(2, int(np.ceil(yearly["average_rank"].max())))
@@ -125,8 +119,9 @@ def render_mobility_analysis(
                      title=f"Average Rank by Year (best {top_n or 10} institutions)",
                      labels={"year": "Year", "average_rank": "Average rank (lower is better)"},
                      hover_data={"institutions": True})
-        # Bars start at rank 1 so the axis never suggests a rank of zero.
-        fig.update_traces(base=1, y=yearly["average_rank"] - 1)
+        # The plotted coordinate is rank minus one, so a baseline of zero maps
+        # to NIRF rank 1 (the best rank).
+        fig.update_traces(base=0, y=yearly["average_rank"] - 1)
         tick_ranks = list(range(1, upper + 1, step))
         fig.update_yaxes(range=[upper - 1, 0], autorange=False,
                          tickmode="array", tickvals=[rank - 1 for rank in tick_ranks],
@@ -138,7 +133,7 @@ def render_mobility_analysis(
         # Use the supplied band labels where available; numeric rank is a fallback.
         data = result.copy()
         data["rank"] = pd.to_numeric(data["rank"], errors="coerce")
-        identity = (["category"] if "category" in data.columns else []) + ["institution"]
+        identity = institution_key_columns(data)
 
         def band_label(row):
             raw_band = row.get("rank_band")
@@ -207,11 +202,12 @@ def render_mobility_analysis(
         if data.empty or data["year"].nunique() < 2:
             direction = "improvement" if chart_type == "improvement" else "decline"
             return go.Figure().update_layout(title=f"Rank {direction} needs ranked records in at least two years")
-        identity = (["category"] if "category" in data.columns else []) + ["institution"]
+        identity = institution_key_columns(data)
         start_year, end_year = int(data["year"].min()), int(data["year"].max())
-        start = data[data["year"].eq(start_year)][identity + ["rank"]].rename(columns={"rank": "start_rank"})
+        display_columns = [c for c in ["institution_label", "state", "institution"] if c in data.columns and c not in identity]
+        start = data[data["year"].eq(start_year)][identity + display_columns + ["rank"]].rename(columns={"rank": "start_rank"})
         end = data[data["year"].eq(end_year)][identity + ["rank"]].rename(columns={"rank": "end_rank"})
-        comparison = start.merge(end, on=identity, how="inner")
+        comparison = start.merge(end, on=identity, how="inner", suffixes=("", "_end"))
         comparison["rank_positions_gained"] = comparison["start_rank"] - comparison["end_rank"]
         metric = "rank_positions_gained"
         if chart_type == "decline":
@@ -224,9 +220,9 @@ def render_mobility_analysis(
         comparison = comparison.nlargest(top_n or 10, metric).sort_values(metric)
         direction = "Improvement" if chart_type == "improvement" else "Decline"
         fig = px.bar(
-            comparison, x=metric, y="institution", orientation="h",
+            comparison, x=metric, y="institution_label", orientation="h",
             title=f"Institutions with the Greatest Rank {direction} ({start_year}-{end_year})",
-            labels={metric: f"Rank positions {direction.lower()}", "institution": "Institution"},
+            labels={metric: f"Rank positions {direction.lower()}", "institution_label": "Institution"},
             hover_data={"start_rank": True, "end_rank": True},
         )
         return fig.update_layout(yaxis={"categoryorder": "total ascending"})
@@ -255,15 +251,17 @@ def render_mobility_analysis(
     if chart_type == "top10":
         data = result[result["rank"].notna() & result["rank"].ge(1)].copy()
         data["in_top10"] = data["rank"].le(10)
-        group_columns = (["category"] if "category" in data.columns else []) + ["institution"]
-        summary = data.groupby(group_columns, dropna=False).agg(
+        group_columns = institution_key_columns(data)
+        summary = data.groupby(group_columns + ["institution_label"], dropna=False).agg(
             years_observed=("year", "nunique"), years_in_top10=("in_top10", "sum")
         ).reset_index()
         summary = summary.sort_values("years_in_top10", ascending=False)
         return px.bar(
-            summary.head(top_n or 20), x="institution", y="years_in_top10",
+            summary.head(top_n or 20), x="institution_label", y="years_in_top10",
+            barmode="group",
             color="category" if "category" in summary and summary["category"].nunique() > 1 else None,
-            hover_data=["years_observed"], title="Top-10 Appearances by Institution"
-        )
+            hover_data=["years_observed"], title="Top-10 Consistency by Institution",
+            labels={"institution_label": "Institution", "years_in_top10": "Years ranked in Top 10", "category": "NIRF category"},
+        ).update_layout(bargap=0.18, bargroupgap=0.04)
 
     raise NotImplementedError(f"M3 chart type not implemented: {chart_type}")

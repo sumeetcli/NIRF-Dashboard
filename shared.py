@@ -5,12 +5,67 @@ import numpy as np
 import pandas as pd
 
 PARAMETER_COLUMNS = ["tlr", "rpc", "go", "oi", "pr"]
+PARAMETER_LABELS = {
+    "tlr": "Teaching, Learning & Resources (TLR)",
+    "rpc": "Research & Professional Practice (RPC)",
+    "go": "Graduation Outcomes (GO)",
+    "oi": "Outreach & Inclusivity (OI)",
+    "pr": "Perception (PR)",
+    "score": "Overall score",
+    "rank": "NIRF rank (lower is better)",
+}
+PLOTLY_COLORWAY = ["#56B4E9", "#E69F00", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7", "#B0B0B0"]
 REQUIRED_COLUMNS = [
     "year", "category", "institution", "state", "score", "rank",
     *PARAMETER_COLUMNS,
 ]
 PROJECT_DIR = Path(__file__).resolve().parent
 DATA_PATH = Path(os.environ.get("NIRF_DATA_PATH", PROJECT_DIR / "data" / "nirf_clean.csv"))
+
+
+def institution_key_columns(data, include_category=True):
+    """Return stable keys for institution records, preferring the dataset ID."""
+    keys = (["category"] if include_category and "category" in data.columns else [])
+    keys.append("institution_id" if "institution_id" in data.columns else "institution")
+    return keys
+
+
+def add_institution_display_label(data):
+    """Add readable labels that disambiguate repeated institution names."""
+    result = data.copy()
+    if "institution" not in result:
+        return result
+    name = result["institution"].fillna("Unknown institution").astype(str)
+    duplicate = result.assign(_name=name).groupby("_name", dropna=False)[
+        "institution_id" if "institution_id" in result else "_name"
+    ].transform("nunique").gt(1) if "institution_id" in result else name.duplicated(keep=False)
+    label = name.copy()
+    if "state" in result:
+        label = label.where(~duplicate, name + " — " + result["state"].fillna("Unknown state").astype(str))
+    if "institution_id" in result:
+        still_duplicate = label.duplicated(keep=False)
+        label = label.where(~still_duplicate, label + " [ID " + result["institution_id"].astype(str) + "]")
+    result["institution_label"] = label
+    return result
+
+
+def apply_chart_theme(fig):
+    """Apply shared dark dashboard styling while retaining chart-specific scales."""
+    fig.update_layout(template="plotly_dark", colorway=PLOTLY_COLORWAY)
+    if not fig.data:
+        message = fig.layout.title.text if fig.layout.title and fig.layout.title.text else "No data for the selected filters"
+        fig.update_layout(
+            title=None,
+            showlegend=False,
+            annotations=[dict(
+                text=message, x=0.5, y=0.5, xref="paper", yref="paper",
+                showarrow=False, font=dict(size=18, color="#D9DEE7"),
+                align="center",
+            )],
+        )
+        fig.update_xaxes(visible=False, showgrid=False, zeroline=False)
+        fig.update_yaxes(visible=False, showgrid=False, zeroline=False)
+    return fig
 
 
 def normalize_years(data):

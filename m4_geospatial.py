@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from .shared import apply_filters, set_integral_year_axis
+from .shared import PLOTLY_COLORWAY, apply_filters, set_integral_year_axis
 
 def prepare_geospatial_analysis(df, filters=None, **params):
     """Prepare state summaries, top-N records, and new-entry counts for M4 charts."""
@@ -30,8 +30,9 @@ def prepare_geospatial_analysis(df, filters=None, **params):
     else:
         ranked = eligible[eligible["rank"].le(top_n)].copy()
 
+    identity_column = "institution_id" if "institution_id" in ranked.columns else "institution"
     state_summary = ranked.groupby(["year", "state"], dropna=False).agg(
-        institutions=("institution", "nunique"),
+        institutions=(identity_column, "nunique"),
         average_rank=("rank", "mean"),
     ).reset_index()
 
@@ -40,7 +41,7 @@ def prepare_geospatial_analysis(df, filters=None, **params):
         .astype(str).str.strip().str.lower().isin(["true", "1", "yes"])
     ]
     entry_summary = new_rows.groupby(["year", "state"], dropna=False).agg(
-        new_entries=("institution", "nunique")
+        new_entries=(identity_column, "nunique")
     ).reset_index()
 
     state_summary = state_summary.merge(entry_summary, on=["year", "state"], how="outer")
@@ -63,7 +64,7 @@ def prepare_geospatial_analysis(df, filters=None, **params):
     }
 
 
-def render_geospatial_analysis(result, chart_type="map", top_states=8, states=None):
+def render_geospatial_analysis(result, chart_type="map", top_states=None, states=None, state_order="representation"):
     """Render M4 state maps and comparisons from prepared geographic summaries."""
     summary = result["state_summary"].copy()
     if summary.empty:
@@ -116,7 +117,7 @@ def render_geospatial_analysis(result, chart_type="map", top_states=8, states=No
             animation_frame="year" if map_data["year"].nunique() > 1 else None,
             color_continuous_scale=choropleth_scale,
             range_color=(0, max_count),
-            title=f"Top {result['top_n']} Ranked Institutions by State",
+            title=(f"Top {result['top_n']} Ranked Institutions by State" if result['top_n'] is not None else "All Ranked Institutions by State"),
             labels={"institutions": "Institutions", "year": "Year"},
         )
         fig.update_traces(marker_line_color="#D0D0D0", marker_line_width=0.8)
@@ -135,12 +136,25 @@ def render_geospatial_analysis(result, chart_type="map", top_states=8, states=No
         plot_data = summary.copy()
         plot_data["year"] = plot_data["year"].astype(int).astype(str)
         year_order = sorted(plot_data["year"].unique(), key=int)
+        state_order = None
+        if top_states is not None:
+            # Select states by total top-N representation across the chosen
+            # years, then keep the per-year grouped bars for those states.
+            state_totals = (
+                plot_data.groupby("state")["institutions"].sum()
+                .nlargest(int(top_states))
+            )
+            state_order = state_totals.index.tolist()
+            plot_data = plot_data[plot_data["state"].isin(state_order)].copy()
         fig = px.bar(
             plot_data, x="state", y="institutions", color="year", barmode="group",
-            category_orders={"year": year_order},
-            color_discrete_sequence=px.colors.qualitative.Safe,
+            category_orders={"year": year_order, **({"state": state_order} if state_order else {})},
+            color_discrete_sequence=PLOTLY_COLORWAY,
             hover_data={"year": True, "new_entries": True, "average_rank": ":.1f"},
-            title=f"Top-{result['top_n']} Institutions by State",
+            title=(
+                f"Top {len(state_order)} States by Top-{result['top_n']} Institution Counts"
+                if state_order else (f"Top-{result['top_n']} Institutions by State" if result['top_n'] is not None else "All Ranked Institutions by State")
+            ),
             labels={"state": "State / UT", "institutions": "Institutions"},
         ).update_layout(
             height=480,
@@ -152,17 +166,31 @@ def render_geospatial_analysis(result, chart_type="map", top_states=8, states=No
         return fig
 
     if chart_type == "state_trend":
-        trend_data = summary[summary["institutions"].gt(0)].copy()
-        coverage = trend_data.groupby("state")["year"].nunique()
-        trend_states = coverage[coverage.ge(2)].index
-        trend_data = trend_data[trend_data["state"].isin(trend_states)]
+        top_states = top_states or 8
+        years = sorted(pd.to_numeric(summary["year"], errors="coerce").dropna().astype(int).unique())
+        states_with_records = sorted(summary.loc[summary["institutions"].gt(0), "state"].dropna().astype(str).unique())
+        if len(years) < 2:
+            return go.Figure().update_layout(title="State trends need ranked records in at least two years")
+        grid = pd.MultiIndex.from_product([years, states_with_records], names=["year", "state"]).to_frame(index=False)
+        trend_data = grid.merge(summary[["year", "state", "institutions"]], on=["year", "state"], how="left")
+        trend_data["institutions"] = trend_data["institutions"].fillna(0).astype(int)
         if trend_data.empty:
             return go.Figure().update_layout(title="No states have ranked institutions in at least two selected years")
-        totals = trend_data.groupby("state")["institutions"].sum().nlargest(top_states)
+        if state_order in {"increase", "decrease"}:
+            ordered = trend_data.sort_values("year").groupby("state")["institutions"].agg(first="first", last="last")
+            ordered["change"] = ordered["last"] - ordered["first"]
+            ordered = ordered[ordered["change"].gt(0) if state_order == "increase" else ordered["change"].lt(0)]
+            if ordered.empty:
+                direction = "increased" if state_order == "increase" else "decreased"
+                return go.Figure().update_layout(title=f"No states {direction} their representation over the selected years")
+            totals = ordered.sort_values("change", ascending=(state_order == "decrease")).head(top_states)
+        else:
+            totals = trend_data.groupby("state")["institutions"].sum().nlargest(top_states)
         plot_data = trend_data[trend_data["state"].isin(totals.index)]
+        cutoff_label = f"Top-{result['top_n']}" if result['top_n'] is not None else "All Ranked"
         fig = px.line(
             plot_data, x="year", y="institutions", color="state", markers=True,
-            title=f"Top {top_states} States: Top-{result['top_n']} Representation Over Time",
+            title=f"Top {top_states} States: {cutoff_label} Representation Over Time",
             labels={"year": "Year", "institutions": "Institutions"},
         )
         return set_integral_year_axis(fig, plot_data["year"].unique())
@@ -234,7 +262,7 @@ def render_geospatial_analysis(result, chart_type="map", top_states=8, states=No
         fig = px.bar(
             entries, x="state", y="new_entries", color="year", barmode="group",
             category_orders={"year": year_order},
-            color_discrete_sequence=px.colors.qualitative.Safe,
+            color_discrete_sequence=PLOTLY_COLORWAY,
             title="Newly Appearing Institutions by State (All States / UTs)",
             labels={"state": "State / UT", "new_entries": "New institutions"},
         ).update_layout(

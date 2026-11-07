@@ -6,7 +6,7 @@ sys.path.insert(0,str(ROOT.parent))
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-from nirf_dashboard.shared import load_data, PARAMETER_COLUMNS, format_category_label
+from nirf_dashboard.shared import load_data, PARAMETER_COLUMNS, format_category_label, apply_chart_theme
 from nirf_dashboard.m3_mobility import prepare_mobility_analysis, render_mobility_analysis
 from nirf_dashboard.m4_geospatial import prepare_geospatial_analysis, render_geospatial_analysis
 from nirf_dashboard.m5_distributions import prepare_distribution_analysis, render_distribution_analysis
@@ -15,9 +15,14 @@ from nirf_dashboard.m7_multivariate import prepare_multivariate_analysis, render
 from nirf_dashboard.m8_language import parse_question, dispatch_question
 
 st.set_page_config(page_title="NIRF Insights Dashboard", page_icon="📊", layout="wide")
+_CHART_RENDER_COUNT = 0
 @st.cache_data
 def get_data(): return load_data()
 def fig_show(fig,key=None,horizontal_scroll=False):
+    global _CHART_RENDER_COUNT
+    chart_key=f"nirf_chart_{_CHART_RENDER_COUNT}_{key or 'auto'}"
+    _CHART_RENDER_COUNT+=1
+    apply_chart_theme(fig)
     if horizontal_scroll:
         chart_width=int(fig.layout.width or 1800)
         html=fig.to_html(
@@ -33,7 +38,7 @@ def fig_show(fig,key=None,horizontal_scroll=False):
             scrolling=False
         )
     else:
-        st.plotly_chart(fig,width="stretch",key=key)
+        st.plotly_chart(fig,width="stretch",key=chart_key)
 try:
     df=get_data()
 except Exception as exc:
@@ -247,6 +252,12 @@ with T[5]:
     if answer:
         if answer.get('status')=='ready':
             st.success(answer['message'])
+            if answer.get('direct_answer'):
+                st.markdown(f"**Answer:** {answer['direct_answer']}")
+                answer_table=answer.get('answer_table')
+                if answer_table is not None and not answer_table.empty:
+                    with st.expander('Chart data for this answer'):
+                        st.dataframe(answer_table, use_container_width=True, hide_index=True)
             fig_show(answer['figure'],horizontal_scroll=answer.get('chart_type')=='new_entries')
         else:
             st.info(answer.get('message','Unable to answer this question.'))

@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from .shared import PARAMETER_COLUMNS, apply_filters, ranked_only, set_integral_year_axis, format_category_label
+from .shared import PARAMETER_COLUMNS, PARAMETER_LABELS, apply_filters, ranked_only, set_integral_year_axis, format_category_label
 
 def prepare_relationship_analysis(df, filters=None, **params):
     """Prepare data for M6 correlation / relationship charts.
@@ -170,13 +170,13 @@ def render_relationship_analysis(
             label = "Linear trend" if trendline == "ols" else f"Polynomial trend (degree {int(degree)})"
             fig.add_trace(go.Scatter(
                 x=grid, y=fitted, mode="lines", name=label,
-                line=dict(color="black", dash="dash"),
+                line=dict(color="#F0E442", dash="dash", width=3),
             ))
             if not np.isnan(r2):
                 r_text += f" | R² = {r2:.2f}"
         fig.update_layout(
-            title=f"{x_var.upper()} vs {y_var.upper()} ({scope}, n = {len(plot_data)}){r_text}",
-            xaxis_title=x_var.upper(), yaxis_title=y_var.upper(),
+            title=f"{PARAMETER_LABELS.get(x_var, x_var.upper())} vs {PARAMETER_LABELS.get(y_var, y_var.upper())} ({scope}, n = {len(plot_data)}){r_text}",
+            xaxis_title=PARAMETER_LABELS.get(x_var, x_var.upper()), yaxis_title=PARAMETER_LABELS.get(y_var, y_var.upper()),
         )
         valid_ranks = pd.to_numeric(data["rank"], errors="coerce").dropna()
         if not valid_ranks.empty:
@@ -190,7 +190,7 @@ def render_relationship_analysis(
 
     if chart_type == "matrix":
         corr = result["correlation"]
-        labels = [c.upper() for c in corr.columns]
+        labels = [PARAMETER_LABELS.get(c, c.upper()) for c in corr.columns]
         fig = px.imshow(
             corr.to_numpy(), x=labels, y=labels, text_auto=".2f",
             zmin=-1, zmax=1, color_continuous_scale="RdBu_r", aspect="auto",
@@ -207,7 +207,7 @@ def render_relationship_analysis(
             return _empty_figure("No parameter correlations with overall score are available")
         summary = correlations.rename_axis("parameter").reset_index(name="correlation")
         summary["direction"] = np.where(summary["correlation"].ge(0), "Positive", "Negative")
-        summary["parameter"] = summary["parameter"].str.upper()
+        summary["parameter"] = summary["parameter"].map(lambda c: PARAMETER_LABELS.get(c, c.upper()))
         summary = summary.reindex(summary["correlation"].abs().sort_values().index)
         fig = px.bar(
             summary, x="correlation", y="parameter", orientation="h", color="direction",
@@ -243,7 +243,7 @@ def render_relationship_analysis(
             fig = px.line(
                 yearly, x="year", y="correlation", markers=True,
                 hover_data=["institutions"],
-                title=f"{x_var.upper()} vs {y_var.upper()}: Correlation by Year ({scope})",
+                title=f"{PARAMETER_LABELS.get(x_var, x_var.upper())} vs {PARAMETER_LABELS.get(y_var, y_var.upper())}: Correlation by Year ({scope})",
             )
             fig.update_yaxes(range=[-1, 1], title=f"{method.title()} correlation")
             return set_integral_year_axis(fig, yearly["year"].unique())
@@ -253,7 +253,7 @@ def render_relationship_analysis(
             frames = []
             for column in [c for c in columns if c != y_var]:
                 yearly = _yearly_correlation(data, column, y_var, method, min_n)
-                yearly["parameter"] = column.upper()
+                yearly["parameter"] = PARAMETER_LABELS.get(column, column.upper())
                 frames.append(yearly)
             long = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
             if long.empty:
@@ -261,7 +261,7 @@ def render_relationship_analysis(
             fig = px.line(
                 long, x="year", y="correlation", color="parameter", markers=True,
                 hover_data=["institutions"],
-                title=f"Correlation of Each Parameter with {y_var.upper()} by Year ({scope})",
+                title=f"Correlation of Each Parameter with {PARAMETER_LABELS.get(y_var, y_var.upper())} by Year ({scope})",
             )
             fig.update_yaxes(range=[-1, 1], title=f"{method.title()} correlation")
             return set_integral_year_axis(fig, long["year"].unique())
@@ -272,10 +272,15 @@ def render_relationship_analysis(
             return _empty_figure("No parameter score columns are available for this trend")
         means = data.groupby("year")[trend_columns].mean().reset_index()
         long = means.melt(id_vars="year", var_name="parameter", value_name="mean_value")
-        long["parameter"] = long["parameter"].str.upper()
+        long["parameter"] = long["parameter"].map(lambda column: PARAMETER_LABELS.get(column, column.upper()))
+        title = (
+            f"Average Institution Score by Year ({scope})"
+            if trend_columns == ["score"]
+            else f"Average Parameter Scores by Year ({scope})"
+        )
         fig = px.line(
             long, x="year", y="mean_value", color="parameter", markers=True,
-            title=f"Average Parameter Scores by Year ({scope})",
+            title=title,
         )
         fig.update_yaxes(title="Mean score")
         return set_integral_year_axis(fig, long["year"].unique())

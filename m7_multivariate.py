@@ -3,12 +3,15 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from .shared import PARAMETER_COLUMNS, apply_filters, ranked_only, set_integral_year_axis, format_category_label
+from .shared import (PARAMETER_COLUMNS, PARAMETER_LABELS, add_institution_display_label, apply_filters,
+                     institution_key_columns, ranked_only, set_integral_year_axis,
+                     format_category_label)
 
 def prepare_multivariate_analysis(df, filters=None, **params):
     parameter_columns = ['tlr', 'rpc', 'go', 'oi', 'pr']
     historical_filters = {k: v for k, v in (filters or {}).items() if k != 'year'}
     data = ranked_only(apply_filters(df, historical_filters or None)).copy()
+    data = add_institution_display_label(data)
     for col in parameter_columns + ['score', 'rank', 'year']:
         data[col] = pd.to_numeric(data[col], errors='coerce')
     available = [c for c in parameter_columns if c in data.columns]
@@ -32,6 +35,13 @@ def prepare_multivariate_analysis(df, filters=None, **params):
     ).where(complete_rows)
     data['research_teaching_gap'] = data['rpc'] - data['tlr']
     data['teaching_perception_gap'] = data['tlr'] - data['pr']
+    scope_columns = [c for c in ['year', 'category'] if c in data]
+    data['research_teaching_high'] = data.groupby(scope_columns)['research_teaching_gap'].transform(
+        lambda s: s.ge(s[s.gt(0)].quantile(.75)) if s.gt(0).any() else False
+    ).fillna(False)
+    data['teaching_perception_high'] = data.groupby(scope_columns)['teaching_perception_gap'].transform(
+        lambda s: s.ge(s[s.gt(0)].quantile(.75)) if s.gt(0).any() else False
+    ).fillna(False)
 
     def detect_outliers(series):
         q1 = series.quantile(0.25)
@@ -50,7 +60,7 @@ def prepare_multivariate_analysis(df, filters=None, **params):
         residual = paired['rpc'] - (slope * paired['score'] + intercept)
         data.loc[paired.index, 'rpc_score_residual'] = residual
     data['rpc_relative_outlier'] = data.groupby(['year', 'category'])['rpc_score_residual'].transform(detect_outliers).fillna(False)
-    group_columns = ['category', 'institution']
+    group_columns = institution_key_columns(data)
     data = data.sort_values(group_columns + ['year']).copy()
     grouped = data.groupby(group_columns)
     data['previous_score'] = grouped['score'].shift(1)
@@ -81,7 +91,7 @@ def render_multivariate_analysis(result, chart_type='radar'):
         plot_data = (
             data.dropna(subset=parameters + ["rank"])
             .sort_values("rank")
-            .drop_duplicates("institution")
+            .drop_duplicates(institution_key_columns(data, include_category=False))
             .head(5)
         )
 
@@ -90,9 +100,9 @@ def render_multivariate_analysis(result, chart_type='radar'):
             values = [row[p] for p in parameters]
             fig.add_trace(go.Scatterpolar(
                 r=values + values[:1],
-                theta=parameters + parameters[:1],
+                theta=[PARAMETER_LABELS.get(p, p.upper()) for p in parameters] + [PARAMETER_LABELS.get(parameters[0], parameters[0].upper())],
                 fill="toself",
-                name=row["institution"]
+                name=row.get("institution_label", row["institution"])
             ))
 
         fig.update_layout(
@@ -102,37 +112,51 @@ def render_multivariate_analysis(result, chart_type='radar'):
         return fig
     elif chart_type == 'parallel':
         plot_data = data.dropna(subset=parameters + ['score'])
-        return px.parallel_coordinates(plot_data, dimensions=parameters, color='score', color_continuous_scale='Viridis', title='Comparison of Five NIRF Parameters')
+        return px.parallel_coordinates(plot_data, dimensions=parameters, color='score', color_continuous_scale='Blues', title='Comparison of Five NIRF Parameters', labels={**{p: PARAMETER_LABELS.get(p, p.upper()) for p in parameters}, 'score':'Overall score'})
 
     elif chart_type == 'gap':
-        return px.scatter(data, x='tlr', y='rpc', color='parameter_gap', hover_name='institution', hover_data=['score', 'rank', 'strongest_parameter', 'weakest_parameter'], title='Teaching and Research Performance Gap', labels={'tlr': 'Teaching Score', 'rpc': 'Research Score', 'parameter_gap': 'Parameter Gap'})
+        plot_data = data.dropna(subset=['parameter_gap']).nlargest(20, 'parameter_gap').copy()
+        if plot_data.empty:
+            return go.Figure().update_layout(title='No complete parameter scores are available')
+        plot_data['institution_year'] = plot_data['institution_label'] + ' (' + plot_data['year'].astype(int).astype(str) + ')'
+        fig = px.bar(plot_data.sort_values('parameter_gap'), x='parameter_gap', y='institution_year', orientation='h',
+            color='strongest_parameter', hover_data=['state', 'strongest_parameter', 'weakest_parameter', 'score'],
+            title='Institutions with the Largest Strongest-to-Weakest Parameter Score Gaps',
+            labels={'parameter_gap':'Strongest minus weakest parameter score points','institution_year':'Institution (year)','strongest_parameter':'Strongest parameter'})
+        return fig.update_layout(yaxis={'categoryorder':'total ascending'})
 
     elif chart_type == 'research_teaching':
         plot_data = data.dropna(subset=['tlr', 'rpc'])
-        fig = px.scatter(plot_data, x='tlr', y='rpc', color='category', hover_name='institution', hover_data=['score', 'rank'], title='Research Performance versus Teaching Performance')
+        plot_data = plot_data.copy()
+        plot_data['Research substantially higher'] = plot_data['research_teaching_high']
+        fig = px.scatter(plot_data, x='tlr', y='rpc', color='Research substantially higher', hover_name='institution_label', hover_data=['state', 'year', 'score', 'rank'], title='Research Performance versus Teaching Performance', labels={'tlr':'Teaching, Learning & Resources (TLR) score','rpc':'Research & Professional Practice (RPC) score'})
         low = min(plot_data['tlr'].min(), plot_data['rpc'].min())
         high = max(plot_data['tlr'].max(), plot_data['rpc'].max())
         fig.add_shape(type='line', x0=low, y0=low, x1=high, y1=high, line={'color': '#FFFFFF', 'dash': 'dash'})
         return fig
 
     elif chart_type == 'teaching_perception':
-        return px.scatter(data, x='tlr', y='pr', color='category', hover_name='institution', hover_data=['score', 'rank'], title='Teaching Performance versus Perception')
+        plot_data = data.copy()
+        plot_data['Teaching substantially higher'] = plot_data['teaching_perception_high']
+        return px.scatter(plot_data, x='tlr', y='pr', color='Teaching substantially higher', hover_name='institution_label', hover_data=['state', 'year', 'score', 'rank'], title='Teaching Performance versus Perception', labels={'tlr':'Teaching, Learning & Resources (TLR) score','pr':'Perception (PR) score'})
 
     elif chart_type == 'parameter_distribution':
-        return px.box(data, x='category', y='parameter_gap', color='category', points='outliers', title='Distribution of Parameter Gaps')
+        plot_data = data.copy()
+        plot_data['category_label'] = plot_data['category'].map(lambda name: format_category_label(name, plot_data))
+        return px.box(plot_data, x='category_label', y='parameter_gap', color='category_label', points='outliers', title='Distribution of Strongest-to-Weakest Parameter Score Gaps', labels={'category_label':'Category (available years)','parameter_gap':'Score point gap'})
 
     elif chart_type == 'outlier':
-        return px.scatter(data, x='score', y='rpc', color='rpc_outlier', hover_name='institution', hover_data=['rank', 'tlr'], title='Research Score Outlier Detection')
+        return px.scatter(data, x='score', y='rpc', color='rpc_outlier', hover_name='institution_label', hover_data=['state', 'year', 'rank', 'tlr'], title='Research Score Outlier Detection', labels={'score':'Overall score','rpc':PARAMETER_LABELS['rpc'],'rpc_outlier':'Research outlier','tlr':PARAMETER_LABELS['tlr']})
 
     elif chart_type == 'research_score_relative_outlier':
         plot_data = data.dropna(subset=['score', 'rpc', 'rpc_score_residual'])
         if plot_data.empty:
             return go.Figure().update_layout(title='Not enough paired research and overall scores to identify relative outliers')
         fig = px.scatter(
-            plot_data, x='score', y='rpc', color='rpc_relative_outlier', hover_name='institution',
-            hover_data=['year', 'rank', 'rpc_score_residual'],
+            plot_data, x='score', y='rpc', color='rpc_relative_outlier', hover_name='institution_label',
+            hover_data=['state', 'year', 'rank', 'rpc_score_residual'],
             title='Research Scores Higher than Expected for Overall Score',
-            labels={'score': 'Overall score', 'rpc': 'Research (RPC) score', 'rpc_relative_outlier': 'Unusually high RPC relative to score'},
+            labels={'score': 'Overall score', 'rpc': PARAMETER_LABELS['rpc'], 'rpc_relative_outlier': 'Unusually high RPC relative to score'},
         )
         if plot_data['score'].nunique() > 1:
             slope, intercept = np.polyfit(plot_data['score'].to_numpy(), plot_data['rpc'].to_numpy(), 1)
@@ -142,7 +166,7 @@ def render_multivariate_analysis(result, chart_type='radar'):
 
     elif chart_type == 'score_change':
         plot_data = data.dropna(subset=['score_change'])
-        fig = px.scatter(plot_data, x='year', y='score_change', color='score_change_outlier', hover_name='institution', hover_data=['previous_score', 'score'], title='Year-to-Year Score Changes')
+        fig = px.scatter(plot_data, x='year', y='score_change', color='score_change_outlier', hover_name='institution_label', hover_data=['state', 'previous_score', 'score'], title='Year-to-Year Overall Score Changes', labels={'score_change':'Change in overall score','score_change_outlier':'Unusual change'})
         return set_integral_year_axis(fig, plot_data['year'].unique())
 
     elif chart_type == 'score_gain_parameter_decline':
@@ -163,7 +187,7 @@ def render_multivariate_analysis(result, chart_type='radar'):
         ].nlargest(30, 'score_change')
         if plot_data.empty:
             return go.Figure().update_layout(title='No adjacent-year cases match: score increased while a parameter declined')
-        plot_data['institution_year'] = plot_data['institution'].astype(str) + ' (' + plot_data['year'].astype(int).astype(str) + ')'
+        plot_data['institution_year'] = plot_data['institution_label'].astype(str) + ' (' + plot_data['year'].astype(int).astype(str) + ')'
         return px.bar(
             plot_data, x='score_change', y='institution_year', color='declining_parameters', orientation='h',
             hover_data=['category', 'previous_score', 'score'],
@@ -179,9 +203,10 @@ def render_multivariate_analysis(result, chart_type='radar'):
         plot_data['strongest_parameter'] = plot_data[parameters].idxmax(axis=1)
         rank_median = float(plot_data['rank'].median())
         parameter_threshold = float(plot_data['strongest_parameter_score'].quantile(0.75))
+        plot_data['strong_parameter_poor_rank'] = plot_data['strongest_parameter_score'].ge(parameter_threshold) & plot_data['rank'].ge(rank_median)
         fig = px.scatter(
-            plot_data, x='rank', y='strongest_parameter_score', color='strongest_parameter',
-            hover_name='institution', hover_data=['year', 'score', 'rank'],
+            plot_data, x='rank', y='strongest_parameter_score', color='strong_parameter_poor_rank',
+            hover_name='institution_label', hover_data=['state', 'year', 'score', 'rank', 'strongest_parameter'],
             title='Strong Parameter Scores versus Overall Rank',
             labels={'rank': 'NIRF rank (higher number is worse)', 'strongest_parameter_score': 'Strongest parameter score', 'strongest_parameter': 'Strongest parameter'},
         )
@@ -194,16 +219,16 @@ def render_multivariate_analysis(result, chart_type='radar'):
             raise ValueError("Select exactly one NIRF category for the volatility chart.")
 
         plot_data = (
-            data.drop_duplicates(["category", "institution"])
+            data.drop_duplicates(institution_key_columns(data))
             .dropna(subset=["rank_volatility"])
             .nlargest(20, "rank_volatility")
         )
 
         fig = px.bar(
             plot_data,
-            x="institution",
+            x="institution_label",
             y="rank_volatility",
-            hover_name="institution",
+            hover_name="institution_label",
             title=f"Top 20 Institutions by Rank Volatility: {format_category_label(data['category'].iloc[0], data)}"
         )
         fig.update_layout(
@@ -213,7 +238,7 @@ def render_multivariate_analysis(result, chart_type='radar'):
         return fig
 
     elif chart_type == 'gap_outlier':
-        return px.scatter(data, x='tlr', y='rpc', color='gap_outlier', hover_name='institution', hover_data=['research_teaching_gap', 'rank'], title='Unusual Research and Teaching Performance Gaps')
+        return px.scatter(data, x='tlr', y='rpc', color='gap_outlier', hover_name='institution_label', hover_data=['state', 'year', 'research_teaching_gap', 'rank'], title='Unusual Research and Teaching Performance Gaps')
 
     else:
         raise ValueError(f"Unknown chart type: {chart_type}")
