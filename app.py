@@ -3,6 +3,13 @@ import sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT.parent))
+# -------------------- Render hosting compatibility --------------------
+import types
+nirf_dashboard = types.ModuleType("nirf_dashboard")
+nirf_dashboard.__path__ = [str(ROOT)]
+nirf_dashboard.__package__ = "nirf_dashboard"
+sys.modules["nirf_dashboard"] = nirf_dashboard
+# ------------------ End Render hosting compatibility ------------------
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
