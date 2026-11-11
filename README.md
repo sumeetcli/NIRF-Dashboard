@@ -1,4 +1,9 @@
-# NIRF dashboard analysis modules
+# NIRF Dashboard Analysis Modules
+
+[![Live Dashboard](https://img.shields.io/badge/Explore-NIRF%20Dashboard-blue?style=for-the-badge&logo=streamlit)](https://nirf-dashboard.onrender.com/)
+
+**Interactive NIRF ranking analysis platform integrating M3-M8 analytical modules.**
+
 
 Extracted from `nirf_dashboard_M3_M8_integrated.ipynb`. The member function implementations are grouped by module; shared data utilities are in `shared.py`.
 
