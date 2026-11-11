@@ -1,6 +1,6 @@
 # NIRF Dashboard Analysis Modules
 
-[![Live Dashboard](https://img.shields.io/badge/Explore-NIRF%20Dashboard-blue?style=for-the-badge&logo=streamlit)](https://nirf-dashboard.onrender.com/)
+🌐 [**NIRF Dashboard - Live Web Application**](https://nirf-dashboard.onrender.com/)
 
 **Interactive NIRF ranking analysis platform integrating M3-M8 analytical modules.**
 
